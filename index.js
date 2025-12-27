@@ -41,31 +41,25 @@ const getApiUrl = (path) => {
     return `${PROXY_BASE}?url=${encodeURIComponent(target)}&referrer=${encodeURIComponent(API_HOST)}`;
 };
 
-// Helper: Format Link (Matches your HTML logic)
+// Helper: Format Link
 const formatLink = (title, rawUrl) => {
     let finalUrl = rawUrl;
-
-    // 1. Fix the m3u8 index pattern (e.g., 123_456.m3u8 -> index_1.m3u8)
     if (/\/(\d+)_(\d+)\.m3u8$/.test(finalUrl)) {
         finalUrl = finalUrl.replace(/\/(\d+)_(\d+)\.m3u8$/, "/index_1.m3u8");
     }
-
-    // 2. Add Player Prefix if it is an m3u8
     if (finalUrl && finalUrl.includes('.m3u8')) {
         finalUrl = `https://smarterz.netlify.app/player?url=${encodeURIComponent(finalUrl)}`;
     }
-
     return finalUrl;
 };
+
+// Helper: Capitalize
+const capitalize = (s) => s && s[0].toUpperCase() + s.slice(1);
 
 // ==========================================
 // 3. CORE LOGIC
 // ==========================================
 
-/**
- * Main Flow Controller
- * recurses automatically if a section is empty to find the next available content.
- */
 const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) => {
     try {
         // --- A. FETCH SUBJECTS ---
@@ -74,11 +68,18 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
 
         // Stop if we went past the last subject
         if (subjectIndex >= subjects.length) {
+            await ctx.reply("📜 **Log:** End of Batch. All subjects checked.");
             return ctx.reply("🎉 **All Caught Up!**\nNo more pending items in this batch.", { parse_mode: 'Markdown' });
         }
 
         const currentSubject = subjects[subjectIndex];
-        const currentType = CONTENT_TYPES[typeIndex]; // 'lectures', 'notes', or 'dpps'
+        const currentType = CONTENT_TYPES[typeIndex]; 
+
+        // --- [FEATURE 2] SEND LOG TO USER ---
+        // Only send this log if we are starting a new section (offset 0) to avoid spamming on "Load More"
+        if (offset === 0) {
+            await ctx.reply(`📜 **Log:** Checking **${currentSubject.name}** for *${currentType.toUpperCase()}*...`, { parse_mode: 'Markdown' });
+        }
 
         // --- B. FETCH CONTENT ---
         const contentUrl = getApiUrl(`/${batchId}/subjects/${currentSubject.id}/${currentType}`);
@@ -88,7 +89,7 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
             const contentRes = await axios.get(contentUrl);
             allItems = contentRes.data.data || [];
         } catch (err) {
-            console.log(`Error fetching ${currentType} for ${currentSubject.name}, skipping...`);
+            console.log(`Error fetching content: ${err.message}`);
         }
 
         // --- C. FILTER COMPLETED ITEMS ---
@@ -99,27 +100,26 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
         const pendingItems = allItems.filter(item => !completedMap[item.id]);
 
         // --- D. CHECK IF EMPTY ---
-        // If no items in this specific section (e.g., Subject 1 Notes), AUTO-SKIP to next
         if (pendingItems.length === 0) {
+            // Log to user that we are skipping
+            await ctx.reply(`⚠️ **Log:** No pending ${currentType} in ${currentSubject.name}. Skipping...`, { parse_mode: 'Markdown' });
+
             // Determine next state
             let nextTypeIdx = typeIndex + 1;
             let nextSubIdx = subjectIndex;
 
-            // If we finished DPPs (index 2), move to next Subject and reset type to Lectures (0)
             if (nextTypeIdx >= CONTENT_TYPES.length) {
                 nextTypeIdx = 0;
                 nextSubIdx++;
             }
 
-            // RECURSIVE CALL (Skip empty section immediately)
+            // RECURSIVE CALL
             return handleContentFlow(ctx, batchId, nextSubIdx, nextTypeIdx, 0);
         }
 
         // --- E. PREPARE BATCH TO SEND ---
-        // If we have items, slice them based on offset
         const itemsToSend = pendingItems.slice(offset, offset + 5);
 
-        // If offset is high but we ran out of items (e.g., clicked "Load More" but only 1 left and we sent it)
         if (itemsToSend.length === 0) {
              // Logic same as empty: move to next section
             let nextTypeIdx = typeIndex + 1;
@@ -131,7 +131,7 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
             return handleContentFlow(ctx, batchId, nextSubIdx, nextTypeIdx, 0);
         }
 
-        // --- F. SEND HEADER (Only on first load of this section) ---
+        // --- F. SEND HEADER ---
         if (offset === 0) {
             const icon = typeIndex === 0 ? '📺' : (typeIndex === 1 ? '📄' : '📝');
             await ctx.reply(`**${currentSubject.name}**\n${icon} ${currentType.toUpperCase()} (${pendingItems.length} pending)`, { parse_mode: 'Markdown' });
@@ -142,9 +142,13 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
             const title = item.title || item.name || 'Untitled';
             const rawUrl = item.url || item.originalUrl || item.baseUrl;
             const finalLink = formatLink(title, rawUrl);
+            
+            // Format Type Label (e.g. "Lecture")
+            const typeLabel = capitalize(currentType).replace(/s$/, '');
 
+            // --- [FEATURE 1] ADD TYPE LINE ---
             await ctx.reply(
-                `📌 **${title}**\n\n🔗 [Click to Open](${finalLink})`,
+                `📌 **${title}**\n📂 **Type:** ${typeLabel}\n\n🔗 [Click to Open](${finalLink})`,
                 {
                     parse_mode: 'Markdown',
                     ...Markup.inlineKeyboard([
@@ -157,7 +161,7 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
         // --- H. NAVIGATION BUTTONS ---
         const buttons = [];
         
-        // 1. "Load More" (If there are more items in THIS specific list)
+        // "Load More"
         if (pendingItems.length > offset + 5) {
             buttons.push(Markup.button.callback(
                 `⬇️ Load More (${currentType})`, 
@@ -165,22 +169,19 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
             ));
         }
 
-        // 2. "Next Section" (Calculate what the next button actually does)
+        // "Next Section"
         let nextT = typeIndex + 1;
         let nextS = subjectIndex;
         let btnLabel = "";
 
         if (nextT < CONTENT_TYPES.length) {
-            // Still in same subject, next type
             btnLabel = `➡️ Next: ${CONTENT_TYPES[nextT]}`;
         } else {
-            // Move to next subject
             nextT = 0;
             nextS = subjectIndex + 1;
             btnLabel = `⏭️ Next Subject`;
         }
 
-        // Only show "Next" button if we haven't exhausted all subjects
         if (nextS < subjects.length) {
             buttons.push(Markup.button.callback(btnLabel, `FLOW_${batchId}_${nextS}_${nextT}_0`));
         }
@@ -189,7 +190,7 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
 
     } catch (e) {
         console.error(e);
-        ctx.reply("⚠️ Network error. Please try clicking the button again.");
+        ctx.reply(`❌ **Log:** Error occurred: ${e.message}`);
     }
 };
 
@@ -198,12 +199,11 @@ const handleContentFlow = async (ctx, batchId, subjectIndex, typeIndex, offset) 
 // ==========================================
 
 bot.start(async (ctx) => {
-    ctx.reply("👋 **Smarterz Bot**\nFetching your batches...", { parse_mode: 'Markdown' });
+    ctx.reply("👋 **Smarterz Bot**\n📜 Log: Fetching batches...", { parse_mode: 'Markdown' });
     try {
         const res = await axios.get(getApiUrl('/batches'));
         const batches = res.data.data || [];
         
-        // Create a grid of buttons (2 per row)
         const buttons = [];
         for(let i=0; i<batches.length; i+=2) {
             const row = [];
@@ -214,40 +214,33 @@ bot.start(async (ctx) => {
         
         ctx.reply('Select a Batch:', Markup.inlineKeyboard(buttons));
     } catch (e) {
-        ctx.reply("❌ Error fetching batches.");
+        ctx.reply("❌ Log: Error fetching batches.");
     }
 });
 
-// START BATCH: Sub 0, Type 0 (Lectures), Offset 0
 bot.action(/^INIT_(\w+)$/, (ctx) => {
     const batchId = ctx.match[1];
-    ctx.answerCbQuery("Starting Batch...");
+    ctx.answerCbQuery("Starting...");
     handleContentFlow(ctx, batchId, 0, 0, 0);
 });
 
-// NAVIGATE FLOW: Batch, SubIdx, TypeIdx, Offset
 bot.action(/^FLOW_(\w+)_(\d+)_(\d+)_(\d+)$/, (ctx) => {
     const [_, batchId, sIdx, tIdx, off] = ctx.match;
     ctx.answerCbQuery("Loading...");
-    ctx.deleteMessage().catch(()=>{}); // Clean up previous menu
+    ctx.deleteMessage().catch(()=>{}); 
     handleContentFlow(ctx, batchId, parseInt(sIdx), parseInt(tIdx), parseInt(off));
 });
 
-// MARK DONE
 bot.action(/^DONE_(.+)$/, async (ctx) => {
     const itemId = ctx.match[1];
     try {
-        // Save to Firebase
         await set(ref(db, 'completed_items/' + itemId), true);
-        
-        // Visual Feedback: Remove Button & Add "Completed" text
         await ctx.editMessageText(
             `${ctx.callbackQuery.message.text}\n\n✅ **COMPLETED**`, 
-            { parse_mode: 'Markdown' } // Remove keyboard (buttons)
+            { parse_mode: 'Markdown' }
         );
-        ctx.answerCbQuery("Marked as done!");
+        ctx.answerCbQuery("Done!");
     } catch (e) {
-        console.error(e);
         ctx.answerCbQuery("Error saving to DB.");
     }
 });
